@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "byost-interview"
+version = "0.1.0"
+description = ""
+authors = ["Bobby Yost <bobby.9202@gmail.com>"]
+readme = "README.md"
+packages = [{include = "byost_interview"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pandas = "==2.0.3"
+psycopg2 = "==2.9.7"
+sqlalchemy = "==2.0.19"
+fastapi = "^0.103.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
