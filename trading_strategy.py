@@ -1,9 +1,10 @@
 import db_backend
-import os
 import argparse
 import pandas as pd
-from datetime import time, datetime, date
-
+import random
+from datetime import datetime, date
+import concurrent.futures
+from functools import partial
 
 
 class TradingStrategy:
@@ -23,9 +24,38 @@ class TradingStrategy:
         df = TradingStrategy.generate_price_forecast_df(current_date, num_simulations)
         return TradingStrategy.get_most_profitable_sinks(node, df)
 
+    @staticmethod
+    def generate_price_forecast(price: pd.Series, max_error: pd.Series):
+        return random.uniform(price - max_error, price + max_error)
 
     @staticmethod
-    def generate_price_forecast_df(current_date: date, num_simulations: int) -> pd.DataFrame():
+    def run_simulation_for_node(current_date: date, num_simulations: int, node: str) -> pd.DataFrame:
+        ...
+        historical_observed = db_backend.get_historical_price(current_date, node)
+        recent_forecast = db_backend.get_recent_price_forecast(current_date, node)
+        historical_forecasted = db_backend.get_historical_price_forecast(current_date, node)
+        current_day = (historical_observed.merge(historical_forecasted, 
+                                                left_on=["observed_datetime", "node"],
+                                                right_on=["forecast_datetime", "node"], 
+                                                suffixes=("_observed", "_forecasted"))
+                        .query("forecast_datetime.dt.date == @current_date")
+                        .copy()
+                        .reset_index(drop=True)
+        )
+
+        current_day["max_error"] = abs(current_day["price_observed"] - current_day["price_forecasted"])
+
+        tmp = pd.DataFrame()
+        for sim in range(num_simulations):
+            tmp["forecast_datetime"] = recent_forecast["forecast_datetime"]
+            tmp["node"] = node
+            tmp["price_forecast"] = TradingStrategy.generate_price_forecast(recent_forecast["price"], 
+                                                                            current_day["max_error"])                 
+            tmp["sim_number"] = sim + 1
+        return tmp
+
+    @staticmethod
+    def generate_price_forecast_df(current_date: date, num_simulations: int) -> pd.DataFrame:
         """Generate a price forecast df by randomly sampling from the forecasts historical range of errors
 
         Args:
@@ -36,21 +66,25 @@ class TradingStrategy:
             Dataframe with columns: forecast_datetime, price_forecast, sim_number
 
         """
+        
         all_nodes = db_backend.get_all_online_nodes(current_date)
-        for node in all_nodes:
-            historical_observed = db_backend.get_historical_price(current_date, node)
-            recent_forecast = db_backend.get_recent_price_forecast(current_date, node)
-            historical_forecasted = db_backend.get_historical_price_forecast(current_date, node)
-        # TODO:
-        # For each node, compute the maximum error as the delta between the node's observed price and its
-        # forecasted price. Then for each simulation generate a random price forecast for each node that is
-        # within the range of the maximum error for that node from its current price forecast. The length of
-        # this output dataframe should be: num_online_nodes * 24 (number of hours forecasted) * num_simulations
-        raise NotImplementedError
+        price_forecast = pd.DataFrame()
+
+
+        func = partial(TradingStrategy.run_simulation_for_node, current_date, num_simulations)
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            results = list(executor.map(func, all_nodes))
+            
+        for result in results:
+            price_forecast = pd.concat([price_forecast, result], ignore_index=True)
+
+        return price_forecast
+
+
 
 
     @staticmethod
-    def get_most_profitable_sinks(node, price_forecast_df) -> pd.DataFrame:
+    def get_most_profitable_sinks(node: str, price_forecast_df: pd.DataFrame) -> pd.DataFrame:
         """Recommend hourly day-ahead trades on the most profitable sinks for the provided node
 
         Args:
@@ -60,20 +94,45 @@ class TradingStrategy:
         Returns:
             DataFrame with columns: forecast_datetime, sink
         """
-        # TODO:
-        # The provided node will be referred to below as the "source" whereas all other nodes in the dataframe
-        # will be referred to as "sinks".
-        #
-        # Trade recommendations should be made using the following criteria:
-        # - The average price of the source across all sims for a given hour < average price of a sink across all
-        #   sims for that hour
-        # - The max price of the source for any sim for a given hour cannot be more than 3x the min price of the
-        #   sink for any simulation for that same hour
-        # - The top 3 sinks (or fewer if not enough meet the above criteria) per hour should be selected. The top trades are
-        #   defined as those with the largest delta between source and sink when averaging across all sims for the given hour
-        # 
-        # The output dataframe should have a length of at most: 24 (number of hours forecasted) * 3 (top sinks) 
-        raise NotImplementedError
+
+        most_profitable_sinks = pd.DataFrame()
+
+        for i in range(24):
+            hourly = (price_forecast_df.query("forecast_datetime.dt.hour == @i")  
+                .groupby(["node"])
+                .agg(["mean", "min", "max"]) # get average, minimum, and maximum forecasted values over range of simulations
+            )
+            source = hourly.query("index == @node")
+            sink_candidates = (hourly.query('@hourly.price_forecast["mean"] < @source.price_forecast["mean"].iloc[0]') # avg price of source across sims < avg price of sink(s) across sims
+                            .query('@source.price_forecast["max"].iloc[0] <= @hourly.price_forecast["min"] * 3')) # max price of sim for source <= 3 * min_price of sink(s)
+            sink_candidates["price_delta"] = abs(sink_candidates.price_forecast["mean"] - source.price_forecast["mean"].iloc[0]) # calculate difference between averages for remaining sinks and the source
+            top_sinks = sink_candidates.sort_values(by=['price_delta'], ascending=False).head(3) # take *UP TO* top 3 sinks according to price_delta field
+            most_profitable_sinks = pd.concat([most_profitable_sinks, top_sinks])
+
+        most_profitable_sinks = (most_profitable_sinks["forecast_datetime"]["mean"]
+            .to_frame()
+            .reset_index()
+            .rename(columns={"node": "sink","mean": "forecast_datetime"})
+            .reindex(columns=["forecast_datetime", "sink"]))
+
+        return most_profitable_sinks
+
+def validate_arguments(date: date, num_sims: int, node: str) -> None:
+    existing_nodes = db_backend.get_all_valid_nodes() 
+    online_nodes = db_backend.get_all_online_nodes(date)
+    valid_dates = db_backend.get_valid_dates()
+    if not isinstance(num_sims, int):
+        raise ValueError("must provider an integer for number of simulations to run")
+    if num_sims <= 0:
+        raise ValueError("provided number of simulations to run must be >= 1")
+    if node not in existing_nodes:
+        raise ValueError("invalid node identifier provided")
+    if node not in online_nodes:
+        raise ValueError("node not online")
+    if not (valid_dates[0] <= date <= valid_dates[-1]):
+        raise ValueError(f"invalid date provided. must be in the range [{valid_dates[0]}, {valid_dates[-1]}]")
+
+        
 
 
 def main():
@@ -84,13 +143,23 @@ def main():
                         default=5, help='Number of simulations to use')
     parser.add_argument('--node', dest='node', action='store', required=False,
                         default='node_1', help='Name of the node for generating trades')
+    parser.add_argument('-o', dest='output', required=False, 
+                        help='Name of file to output trade recommendation dataframe to')
     args = parser.parse_args()
     if type(args.current_date) is str:
         current_date = datetime.strptime(args.current_date, '%Y-%m-%d').date()
     else:
         current_date = args.date
 
-    TradingStrategy().get_trade_recommendations(current_date, args.node, int(args.num_sims))
+    validate_arguments(current_date, int(args.num_sims), args.node)
+
+
+    trade_recommendations = TradingStrategy().get_trade_recommendations(current_date, args.node, int(args.num_sims))
+    if args.output:
+        trade_recommendations.to_csv(path_or_buf=args.output, index=False)
+    else:
+        print(trade_recommendations)
+        
 
 
 if __name__ == '__main__':

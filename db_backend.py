@@ -1,11 +1,41 @@
 import pandas as pd
 from datetime import date, datetime, timedelta
 from typing import List
+from os import getenv
 
 # You can leave this connection string as is even though there's a password visible in the codebase
 # Otherwise, make as many changes to this file as you feel are necessary.
-CONNECTION_STRING = 'postgresql://postgres_user:password@db:5432/market_data'
 
+PG_USER = getenv("PGUSER")
+PG_PASSWORD = getenv("PGPASSWORD")
+PG_HOST = getenv("PGHOST")
+CONNECTION_STRING = f'postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:5432/market_data'
+
+def get_all_valid_nodes() -> List[str]:
+    """Return all valid node identifiers
+
+    Returns:
+        List of all valid node identifiers
+
+    """
+    sql = f'''
+        SELECT DISTINCT node FROM public.node_status;
+    '''
+    return pd.read_sql(sql, CONNECTION_STRING)['node'].tolist()
+
+def get_valid_dates() -> List[date]:
+    """Return all of the dates forecast analyses have been run on 
+
+    Returns:
+        List of dates that forecasts analyses have been run on 
+
+    """
+    sql = f'''
+        SET timezone = 'GMT';
+        SELECT DISTINCT forecasted_price.analysis_datetime::DATE FROM public.forecasted_price 
+        ORDER BY analysis_datetime ASC;
+    '''
+    return pd.read_sql(sql, CONNECTION_STRING)['analysis_datetime'].tolist()
 
 def get_all_online_nodes(current_date: date) -> List[str]:
     """Given a date, return all the nodes that are online at the start of that date
@@ -17,6 +47,7 @@ def get_all_online_nodes(current_date: date) -> List[str]:
         List of online nodes
     """
     sql = f'''
+        SET timezone = 'GMT';
         SELECT node FROM public.node_status
         WHERE online = true AND observed_datetime = \'{current_date}\'
        '''
@@ -38,9 +69,10 @@ def get_recent_price_forecast(current_date: date, node: str) -> pd.DataFrame:
         DataFrame with columns: forecast_datetime, node, price
     """
     sql = f'''
+        SET timezone = 'GMT';
         SELECT forecast_datetime, node, price FROM public.forecasted_price
-        WHERE analysis_datetime::DATE = \'{current_date}\'
-        AND node = \'{node}\'
+        WHERE forecast_datetime::DATE = (\'{current_date + timedelta(days=1)}\'::DATE)
+        AND node = \'{node}\';
        '''
     return pd.read_sql(sql, CONNECTION_STRING)
 
@@ -60,6 +92,7 @@ def get_historical_price_forecast(current_date: date, node: str):
         DataFrame with columns: forecast_datetime, node, price
     """
     sql = f'''
+        SET timezone = 'GMT';
         SELECT forecast_datetime, node, price FROM public.forecasted_price
         WHERE analysis_datetime < \'{current_date}\'
         AND node = \'{node}\'
@@ -80,8 +113,9 @@ def get_historical_price(current_date: date, node: str):
         DataFrame with columns: observed_datetime, node, price
     """
     sql = f'''
+        SET timezone = 'GMT';
         SELECT observed_datetime, node, price FROM public.observed_price
-        WHERE observed_datetime <= \'{current_date}\'
+        WHERE observed_datetime < (\'{current_date + timedelta(days=1)}\'::date)
         AND node = \'{node}\'
        '''
     return pd.read_sql(sql, CONNECTION_STRING)

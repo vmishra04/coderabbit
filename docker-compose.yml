@@ -8,19 +8,23 @@ services:
       POSTGRES_PASSWORD: password
     ports:
       - '5432:5432'
-#    healthcheck:
-#      test: ["CMD-SHELL", "sh -c 'pg_isready -U postgres_user -d market_data'"]
-#      interval: 10s
-#      timeout: 3s
-#      retries: 3
+    #    healthcheck:
+    #      test: ["CMD-SHELL", "sh -c 'pg_isready -U postgres_user -d market_data'"]
+    #      interval: 10s
+    #      timeout: 3s
+    #      retries: 3
     volumes:
       - ./db_init:/docker-entrypoint-initdb.d/
   trading_strategy:
     build: .
     entrypoint: "python -m trading_strategy"
+    environment:
+      PGHOST: db
+      PGUSER: postgres_user
+      PGPASSWORD: password
     depends_on:
       - db
-#      db:
-#        condition: service_healthy
+    #      db:
+    #        condition: service_healthy
     links:
       - db
